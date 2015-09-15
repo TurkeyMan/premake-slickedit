@@ -10,6 +10,7 @@
 	local tree = p.tree
 	local project = p.project
 	local config = p.config
+	local fileconfig = p.fileconfig
 	local slickedit = p.modules.slickedit
 
 	slickedit.project = {}
@@ -167,33 +168,44 @@
 		}
 		local exec = { cmdLine = "" }
 
+		local mkdir = "mkdir -p " .. cfg.buildtarget.directory
+
 		if cfg.kind == premake.STATICLIB then
 			if cfg.architecture == premake.UNIVERSAL then
 				exec.cmdLine = 'libtool %xup -o "%o" %f'
 			else
 				local tool = toolset.gettoolname({gccprefix=""}, "ar")
-				exec.cmdLine = tool .. ' -rs %xup "%o" %f'  -- TODO CHECK THAT THIS IS CORRECT? should be -rcs?
---				exec.cmdLine = tool .. ' -rcs %xup "%o" %f'
+				exec.cmdLine = mkdir .. " && " .. tool .. ' -rs %xup "%o" %f'  -- TODO CHECK THAT THIS IS CORRECT? should be -rcs?
+--				exec.cmdLine = mkdir .. " && " .. tool .. ' -rcs %xup "%o" %f'
 			end
 		else
 			-- build command line
 			local tool = toolset.gettoolname({gccprefix=""}, iif(cfg.language == "C", "cc", "cxx"))
-			exec.cmdLine = tool .. ' %xup '
+			exec.cmdLine = mkdir .. " && " .. tool .. ' %xup '
 
 			-- compile flags
 			local ldFlags = toolset.getldflags(cfg)
 			exec.cmdLine = exec.cmdLine .. table.concat(ldFlags, " ")
 
+			-- lib paths
+			local libPaths = toolset.getLibraryDirectories(cfg)
+			if #libPaths > 0 then
+				exec.otherOptions = table.concat(libPaths, " ")
+			end
+
 			-- additional build options
 			if #cfg.linkoptions > 0 then
-				exec.otherOptions = table.concat(cfg.linkoptions, " ")
+				if exec.otherOptions then
+					exec.otherOptions = exec.otherOptions .. " "
+				else
+					exec.otherOptions = ""
+				end
+				exec.otherOptions = exec.otherOptions .. table.concat(cfg.linkoptions, " ")
 				exec.cmdLine = exec.cmdLine .. ' %~other'
 			end
 
-			-- TODO: lib paths???
-
 			-- output and source file
-			exec.cmdLine = exec.cmdLine .. ' -o "%o" %objs %libs'
+			exec.cmdLine = exec.cmdLine .. ' -o "%o" %f %libs'
 		end
 
 		m.emit_target(options, exec)
@@ -211,7 +223,8 @@
 		}
 
 		-- HACK: clear before each build...
-		options.clearProcessBuffer = "1"
+--		options.clearProcessBuffer = "1"
+--		options.verbose = "1"
 
 		local exec = { cmdLine = '"%(VSLICKBIN1)vsbuild" "%w" "%r" -t build' }
 		m.emit_target(options, exec)
@@ -350,7 +363,8 @@
 			_p(2, '<Dependencies Name="%s">', name)
 
 			for _, dependency in ipairs(dependencies) do
-				_p(3, '<Dependency Project="%s.vpj"/>', dependency.filename) -- TODO: filename should already have extension. no?
+				local path = project.getrelative(cfg.project, dependency.filename)
+				_p(3, '<Dependency Project="%s.vpj"/>', path)
 			end
 
 			_p(2, '</Dependencies>');
@@ -361,9 +375,25 @@
 
 -- PreBuildCommands
 
+	function m.customBuilds(cfg)
+		local files = {}
+		local tr = project.getsourcetree(cfg.project)
+		tree.traverse(tr, {
+			onleaf = function(node)
+				local fcfg = fileconfig.getconfig(node, cfg)
+				if fileconfig.hasCustomBuildRule(fcfg) then
+					table.insert(files, node)
+				end
+			end
+		})
+		return files
+	end
+
 	function m.prebuild(cfg)
 
-		if #cfg.prebuildcommands > 0 then
+		local customFiles = m.customBuilds(cfg)
+
+		if #cfg.prebuildcommands > 0 or #customFiles > 0 then
 
 			local stopOnError = "" -- ' StopOnError="1"'
 			_p(2, '<PreBuildCommands%s>', stopOnError)
@@ -374,6 +404,19 @@
 
 			for i, cmd in ipairs(cfg.prebuildcommands) do
 				_p(3, '<Exec CmdLine=%s/>', m.quote_string(cmd))
+			end
+
+			for i, file in ipairs(customFiles) do
+				local fcfg = fileconfig.getconfig(file, cfg)
+				if fcfg.buildmessage ~= nil then
+					_p(3, '<Exec CmdLine=%s/>', m.quote_string("echo " .. m.quote_string(fcfg.buildmessage)))
+				end
+				if #fcfg.buildcommands > 0 then
+					for i, cmd in ipairs(fcfg.buildcommands) do
+						_p(3, '<Exec CmdLine=%s/>', m.quote_string(cmd))
+					end
+				end
+--				fcfg.buildoutputs = { output }
 			end
 
 			_p(2, '</PreBuildCommands>')
@@ -494,6 +537,7 @@
 		"OutputFile",
 		"CompilerConfigName",
 		"Defines",
+		"ObjectDir",
 	}
 	function m.generate(prj)
 		p.utf8()
@@ -526,8 +570,9 @@
 				type = "gnuc",
 				debugCallbackName = "gdb",
 				version = "1",
-				outputFile = cfg.buildtarget.relpath,
+				outputFile = cfg.buildtarget.abspath,
 				compilerConfigName = "Latest Version",
+				objectDir = cfg.objdir,
 			}
 
 			-- defines and undefines
